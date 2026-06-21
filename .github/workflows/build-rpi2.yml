@@ -30,8 +30,10 @@ jobs:
           sudo apt-get install -y \
             build-essential libncurses-dev libssl-dev \
             bc rsync cpio unzip wget git python3 \
-            file bison flex
+            file bison flex ccache
 
+      # ============ 缓存层 ============
+      # 1) 源码下载目录：避免重复下载几百 MB 源码
       - name: Cache download directory (dl/)
         uses: actions/cache@v4
         with:
@@ -40,13 +42,55 @@ jobs:
           restore-keys: |
             dl-rpi2-
 
+      # 2) 已编译的工具链：省掉 GCC/binutils 编译（最大头，省 30-60 min）
+      #    key 绑定 defconfig + 工具链源码 hash，源码更新就强制重编，避免版本不匹配
+      - name: Cache toolchain (output/host)
+        uses: actions/cache@v4
+        with:
+          path: |
+            output/host
+            output/build
+          key: host-rpi2-${{ hashFiles('configs/raspberrypi2_defconfig', 'package/gcc/*', 'package/binutils/*', 'package/gdb/*', 'toolchain/*') }}
+          # 不加 restore-keys：工具链版本不匹配时宁可重编，避免诡异错误
+
+      # 3) ccache 缓存：跨构建复用 C/C++ 编译产物，二次编译大幅提速
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildroot-ccache
+          # 用 run_id 保证每次都保存新版本；restore-keys 兜底用最近一次
+          key: ccache-rpi2-${{ github.run_id }}
+          restore-keys: |
+            ccache-rpi2-
+
+      # ============ 配置层 ============
       - name: Configure for Raspberry Pi 2
         run: make raspberrypi2_defconfig
 
-      # 如果需要修改配置，可在此步骤加载自定义 fragment，例如：
-      #   echo 'BR2_PACKAGE_NANO=y' > custom.config
-      #   make savedefconfig 查看差异
-      # 默认保持官方 defconfig 不变
+      # 自定义配置 fragment：在官方 defconfig 基础上叠加修改，不污染原始配置
+      # 启用 ccache 加速二次编译；下面留了常用包的模板，去掉 # 即可启用
+      - name: Apply custom config fragment
+        run: |
+          cat > .custom.config <<'EOF'
+          # === 性能优化 ===
+          BR2_CCACHE=y
+          BR2_CCACHE_DIR="/home/runner/.buildroot-ccache"
+
+          # === 常用包（去掉前面的 # 即可启用） ===
+          # BR2_PACKAGE_NANO=y
+          # BR2_PACKAGE_HTOP=y
+          # BR2_TARGET_ENABLE_ROOT_LOGIN=y
+          # BR2_TARGET_GENERIC_ROOT_PASSWD="raspberry"
+          EOF
+          # 合并 fragment 到 .config
+          support/kconfig/merge_config.sh -m .config .custom.config
+          # 让 Buildroot 重算依赖关系，吸收新增选项
+          make olddefconfig
+
+      - name: Show effective config (debug)
+        run: grep -E '^BR2_(CCACHE|PACKAGE_|TARGET_)' .config | sort
+
+      # ============ 编译层 ============
       - name: Build
         run: make -j$(nproc)
 
