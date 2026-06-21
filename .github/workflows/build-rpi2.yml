@@ -1,0 +1,86 @@
+name: Build Buildroot for Raspberry Pi 2
+
+# 触发条件：推送到 main / master 分支、打 tag、以及手动运行
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  workflow_dispatch: # 允许在 Actions 页面手动触发
+
+# 防止同一分支重复构建同时抢占 runner
+concurrency:
+  group: build-rpi2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # Buildroot 全量编译可能需要数小时
+
+    steps:
+      - name: Checkout Buildroot
+        uses: actions/checkout@v4
+
+      - name: Install Buildroot build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential libncurses-dev libssl-dev \
+            bc rsync cpio unzip wget git python3 \
+            file bison flex
+
+      - name: Cache download directory (dl/)
+        uses: actions/cache@v4
+        with:
+          path: dl
+          key: dl-rpi2-${{ hashFiles('configs/raspberrypi2_defconfig') }}
+          restore-keys: |
+            dl-rpi2-
+
+      - name: Configure for Raspberry Pi 2
+        run: make raspberrypi2_defconfig
+
+      # 如果需要修改配置，可在此步骤加载自定义 fragment，例如：
+      #   echo 'BR2_PACKAGE_NANO=y' > custom.config
+      #   make savedefconfig 查看差异
+      # 默认保持官方 defconfig 不变
+      - name: Build
+        run: make -j$(nproc)
+
+      - name: Collect build artifacts
+        run: |
+          mkdir -p artifacts
+          # 主 SD 卡镜像（写入 TF 卡即可启动）
+          cp output/images/sdcard.img artifacts/raspberrypi2-sdcard.img 2>/dev/null || true
+          # 其他可能有用的产物
+          cp output/images/zImage artifacts/ 2>/dev/null || true
+          cp output/images/rootfs.tar.gz artifacts/ 2>/dev/null || true
+          # 记录本次构建信息
+          {
+            echo "Build time: $(date -u)"
+            echo "Commit: ${{ github.sha }}"
+            echo "Branch/tag: ${{ github.ref_name }}"
+            echo "Buildroot rev: $(git rev-parse HEAD)"
+          } > artifacts/build-info.txt
+
+      - name: Upload SD card image
+        uses: actions/upload-artifact@v4
+        with:
+          name: raspberrypi2-sdcard-img
+          path: artifacts/raspberrypi2-sdcard.img
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload other artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: raspberrypi2-extras
+          path: |
+            artifacts/zImage
+            artifacts/rootfs.tar.gz
+            artifacts/build-info.txt
+          if-no-files-found: ignore
+          retention-days: 14
